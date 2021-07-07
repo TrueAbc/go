@@ -1,14 +1,15 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -51,6 +52,7 @@ func (d *Downloader) multiDownload(strUrl, filename string, contentLen int) erro
 	wg.Add(d.concurrency)
 
 	rangeStart := 0
+	bar := CustomedBar(contentLen, "downloading with "+strconv.Itoa(d.concurrency)+" goroutines")
 	for i := 0; i < d.concurrency; i++ {
 		// 并发请求
 		go func(i, rangeStart int) {
@@ -62,46 +64,51 @@ func (d *Downloader) multiDownload(strUrl, filename string, contentLen int) erro
 				rangeEnd = contentLen - 1 // range从0开始
 			}
 
-			d.downloadPartial(strUrl, filename, rangeStart, rangeEnd, i)
+			d.downloadPartial(bar, strUrl, filename, rangeStart, rangeEnd, i)
 		}(i, rangeStart)
 
 		rangeStart += pageSize + 1
 	}
 
 	wg.Wait()
-
-	d.merge(filename)
+	log.Println("start merge partial files together")
+	d.merge(filename, contentLen)
 
 	return nil
 }
 
 // 合并文件
-func (d *Downloader) merge(filename string) error {
+func (d *Downloader) merge(filename string, contentLen int) error {
 	destFile, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY, 0666)
+	log.Println("filename of destFile " + filename)
 	if err != nil {
+		log.Println(err)
 		return err
 	}
 
-	log.Println("start merge partial files together")
-	defer destFile.Close()
-	defer func ()  {
+	dstBuf := bufio.NewWriter(destFile)
+	defer func() {
+		destFile.Close()
 		log.Println("finished files merging")
 	}()
-	bar := CustomedBar(-1, "merging file partials")
+	bar := CustomedBar(contentLen, "merging file partials")
 
 	for i := 0; i < d.concurrency; i++ {
 		partFileName := d.getPartFilename(filename, i)
 		partFile, err := os.Open(partFileName)
+		src := bufio.NewReader(partFile)
 		if err != nil {
 			return err
 		}
-		io.Copy(io.MultiWriter(destFile, bar), partFile)
+
+		io.Copy(io.MultiWriter(dstBuf, bar), src)
 		partFile.Close()
 
 		os.Remove(partFileName)
 	}
-	
-	return nil
+
+	// 最终的落盘
+	return dstBuf.Flush()
 }
 
 func (d *Downloader) singleDownload(strUrl, filename string) error {
@@ -109,7 +116,7 @@ func (d *Downloader) singleDownload(strUrl, filename string) error {
 }
 
 // 下载文件
-func (d *Downloader) downloadPartial(strUrl, filename string, rangeStart, rangeEnd, i int) {
+func (d *Downloader) downloadPartial(bar *pg.ProgressBar, strUrl, filename string, rangeStart, rangeEnd, i int) {
 	if rangeStart >= rangeEnd {
 		return
 	}
@@ -135,8 +142,6 @@ func (d *Downloader) downloadPartial(strUrl, filename string, rangeStart, rangeE
 
 	defer partFile.Close()
 
-	bar := CustomedBar(rangeEnd-rangeStart+1, "downloading progress"+strconv.Itoa(i))
-
 	_, err = io.Copy(io.MultiWriter(partFile, bar), resp.Body)
 	if err != nil {
 		if err == io.EOF {
@@ -149,13 +154,13 @@ func (d *Downloader) downloadPartial(strUrl, filename string, rangeStart, rangeE
 
 // 部分文件存放的路径
 func (d *Downloader) getPartDir(filename string) string {
-	return strings.SplitN(filename, ".", 2)[0]
+	return "./tmp"
 }
 
 // 构建部分文件的名字
 func (d *Downloader) getPartFilename(filename string, partNum int) string {
 	partDir := d.getPartDir(filename)
-	return fmt.Sprintf("%s/%s-%d", partDir, filename, partNum)
+	return filepath.Join(partDir, filename+"-"+strconv.Itoa(partNum))
 }
 
 func NewDownloader(concurrency int) *Downloader {
@@ -181,7 +186,6 @@ func CustomedBar(length int, desc string) *pg.ProgressBar {
 			BarEnd:        "]",
 		}),
 
-		// pg.OptionSetWriter(logrus.Info),
 		pg.OptionUseANSICodes(true),
 		pg.OptionThrottle(time.Second),
 		pg.OptionSetPredictTime(true),
