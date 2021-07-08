@@ -22,9 +22,10 @@ func main() {
 				Required: true,
 			},
 			&cli.StringFlag{
-				Name:    "output",
-				Aliases: []string{"o"},
-				Usage:   "Output filename",
+				Name:     "output",
+				Aliases:  []string{"o"},
+				Usage:    "Output filename",
+				Required: true,
 			},
 			&cli.IntFlag{
 				Name:    "concurrency",
@@ -37,10 +38,12 @@ func main() {
 			strURL := c.String("url")
 			filename := c.String("output")
 			concurrency := c.Int("concurrency")
-			return NewDownloader(concurrency).Download(strURL, filename)
+
+			loader := NewDownloader(concurrency, strURL, filename)
+
+			return loader.Download()
 		},
 	}
-
 	err := app.Run(os.Args)
 	if err != nil {
 		log.Fatal(err)
