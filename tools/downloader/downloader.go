@@ -1,13 +1,15 @@
 package main
 
 import (
-	"bufio"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"time"
@@ -15,14 +17,25 @@ import (
 	pg "github.com/schollz/progressbar/v3"
 )
 
-const tmpDir = "./tmp"
+// 固定路径用于进行断点续传
+var baseDir = path.Join("", "abcDownloader")
+
+func init() {
+	_, err := os.Stat(baseDir) //os.Stat获取文件信息
+	if err != nil {
+		if os.IsExist(err) {
+			return
+		}
+		os.Mkdir(baseDir, 0770)
+	}
+}
+
+var tmpDir = path.Join(baseDir, "tmp")
 
 type Downloader struct {
 	concurrency int
 	url         string
 	filename    string
-
-	contentLen int // 记录单次下载的长度
 
 	totalSize int
 	tasks     []chan struct{} //  用于在文件合并的过程中进行控制
@@ -48,8 +61,7 @@ func (d *Downloader) Download() error {
 
 	if resp.StatusCode == http.StatusOK && resp.Header.Get("Accept-Ranges") == "bytes" {
 		// ok for range download
-		log.Println("range download is avaliable")
-		d.contentLen = int(resp.ContentLength)
+		log.Println("range download is avaliable, contentlen is " + strconv.Itoa(int(resp.ContentLength)))
 		return d.multiDownload(d.url, d.filename, int(resp.ContentLength))
 	}
 
@@ -57,29 +69,38 @@ func (d *Downloader) Download() error {
 }
 
 func (d *Downloader) multiDownload(strUrl, filename string, contentLen int) error {
-	pageSize := (contentLen - d.totalSize) / d.concurrency
+	pageSize := int(math.Ceil((float64(contentLen) - float64(d.totalSize)) / float64(d.concurrency)))
 	// 创建临时文件夹
 	partDir := d.getPartDir(filename)
 	log.Println("tmp dir of this download is:" + partDir)
-	os.Mkdir(partDir, 0777)
+	log.Println("range download of this time froms " + strconv.Itoa(d.totalSize) + " to " + strconv.Itoa(contentLen))
+	err := os.MkdirAll(partDir, 0777)
+	if err != nil {
+		log.Println(err)
+		return err
+	}
 	defer os.RemoveAll(partDir)
 
-	rangeStart := 0
+	rangeStart := d.totalSize
+	if rangeStart > contentLen {
+		return nil
+	}
 	bar := CustomedBar(contentLen, "downloading with "+strconv.Itoa(d.concurrency)+" goroutines")
+	bar.Add(rangeStart)
+
 	for i := 0; i < d.concurrency; i++ {
 		// 并发请求
 		go func(i, rangeStart int) {
 
 			rangeEnd := rangeStart + pageSize
 			// 最后一段保证Contenlen
-			if rangeEnd > contentLen {
-				rangeEnd = contentLen - 1 // range从0开始
+			if rangeEnd >= contentLen {
+				rangeEnd = contentLen - 1
 			}
 
 			d.downloadPartial(bar, strUrl, filename, rangeStart, rangeEnd)
 			// 实现多协程的精确控制
 			<-d.tasks[i]
-			fmt.Println("goroutine " + strconv.Itoa(i))
 			d.merge(d.filename, rangeStart, rangeEnd)
 			d.tasks[i+1] <- struct{}{}
 
@@ -89,10 +110,11 @@ func (d *Downloader) multiDownload(strUrl, filename string, contentLen int) erro
 		rangeStart += pageSize + 1
 	}
 	// 启动了所有的线程之后, 向0号线程发送合并信号
-	fmt.Println("start sendig merging signal")
+	log.Println("start sendig merging signal")
 	d.tasks[0] <- struct{}{}
 	// 最终收到最后一个线程发送的结束指令
 	<-d.tasks[d.concurrency]
+	log.Println("finish merging process")
 
 	return nil
 }
@@ -100,36 +122,35 @@ func (d *Downloader) multiDownload(strUrl, filename string, contentLen int) erro
 // 合并文件, 非线程安全, 通过downloader的通道进行控制
 func (d *Downloader) merge(filename string, start, end int) error {
 	newval := d.SetTotalSize(start, end)
-	fmt.Printf("start:%d, end:%d, new:%d\n", start, end, newval)
 	if newval != end+1 {
 		return errors.New("merge failed for file")
 	}
 
-	destFile, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	destFile, err := os.OpenFile(path.Join(baseDir, filename), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
 		log.Println(err)
 		return err
 	}
 
-	dstBuf := bufio.NewWriter(destFile)
 	defer func() {
 		destFile.Close()
 	}()
 
 	partFileName := d.getPartFilename(filename, start, end)
 	partFile, err := os.Open(partFileName)
-	src := bufio.NewReader(partFile)
 	if err != nil {
+
 		return err
 	}
 
-	io.Copy(dstBuf, src)
+	_, err = io.Copy(destFile, partFile)
+	if err != nil {
+		log.Println(err)
+	}
 	partFile.Close()
-	fmt.Println(partFileName)
 	os.Remove(partFileName)
 
-	// 最终的落盘
-	return dstBuf.Flush()
+	return nil
 }
 
 func (d *Downloader) singleDownload(strUrl, filename string) error {
@@ -189,12 +210,22 @@ func NewDownloader(concurrency int, url, filename string) *Downloader {
 	for i := 0; i < concurrency+1; i++ {
 		tasks = append(tasks, make(chan struct{}))
 	}
+	// filename 加上url的hash值
+	var res = fmt.Sprintf("%x", sha256.Sum256([]byte(url)))
+	filename = res + "_" + filename
+
+	fi, err := os.Stat(path.Join(baseDir, filename))
+	var totalSize int
+	if err == nil {
+		log.Println("start from breakpoint " + strconv.Itoa(int(fi.Size())))
+		totalSize = int(fi.Size())
+	}
+
 	return &Downloader{
 		concurrency: concurrency,
 		url:         url,
 		filename:    filename,
-		contentLen:  -1,
-		totalSize:   0,
+		totalSize:   totalSize,
 		tasks:       tasks,
 	}
 }
