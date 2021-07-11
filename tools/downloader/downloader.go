@@ -133,6 +133,7 @@ func (d *Downloader) merge(filename string, start, end int) error {
 	}
 
 	defer func() {
+		fmt.Println("dest file is closed")
 		destFile.Close()
 	}()
 
@@ -149,6 +150,7 @@ func (d *Downloader) merge(filename string, start, end int) error {
 	}
 	partFile.Close()
 	os.Remove(partFileName)
+	log.Println("merge of tmp file:" + partFileName)
 
 	return nil
 }
